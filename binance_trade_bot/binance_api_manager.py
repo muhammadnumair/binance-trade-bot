@@ -2,6 +2,7 @@ import math
 import time
 import traceback
 from typing import Dict, Optional
+from requests.exceptions import ConnectionError, ReadTimeout, RequestException
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -16,21 +17,39 @@ from .models import Coin
 
 class BinanceAPIManager:
     def __init__(self, config: Config, db: Database, logger: Logger, testnet = False):
-        # initializing the client class calls `ping` API endpoint, verifying the connection
-        self.binance_client = Client(
-            config.BINANCE_API_KEY,
-            config.BINANCE_API_SECRET_KEY,
-            tld=config.BINANCE_TLD,
-            testnet=testnet,
-        )
+        self.config = config
         self.db = db
         self.logger = logger
-        self.config = config
         self.testnet = testnet
-
         self.cache = BinanceCache()
         self.stream_manager: Optional[BinanceStreamManager] = None
+        self._initialize_client()
         self.setup_websockets()
+
+    def _initialize_client(self):
+        """Initialize or reinitialize the Binance client"""
+        self.binance_client = Client(
+            self.config.BINANCE_API_KEY,
+            self.config.BINANCE_API_SECRET_KEY,
+            tld=self.config.BINANCE_TLD,
+            testnet=self.testnet,
+        )
+
+    def _retry_on_error(self, func, *args, max_retries=3, **kwargs):
+        """Generic retry mechanism for API calls"""
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except (ConnectionError, ReadTimeout, RequestException, BinanceAPIException) as e:
+                last_exception = e
+                self.logger.warning(f"API call failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    if isinstance(e, (ConnectionError, ReadTimeout)):
+                        self._initialize_client()  # Reinitialize client on connection errors
+                continue
+        raise last_exception
 
     def setup_websockets(self):
         self.stream_manager = BinanceStreamManager(
@@ -43,71 +62,74 @@ class BinanceAPIManager:
     @cached(cache=TTLCache(maxsize=1, ttl=43200))
     def get_trade_fees(self) -> Dict[str, float]:
         if not self.testnet:
-            return {ticker["symbol"]: float(ticker["takerCommission"]) for ticker in self.binance_client.get_trade_fee()}
+            return {ticker["symbol"]: float(ticker["takerCommission"]) 
+                   for ticker in self._retry_on_error(self.binance_client.get_trade_fee)}
 
-
-        ## testnet does not provide trade fee API, emulating it
-        exchange_info = self.binance_client.get_exchange_info()
+        # testnet does not provide trade fee API, emulating it
+        exchange_info = self._retry_on_error(self.binance_client.get_exchange_info)
         symbols = exchange_info["symbols"]
         return {
             symbol["symbol"]: 0.001
             for symbol in symbols
         }
 
-
     @cached(cache=TTLCache(maxsize=1, ttl=60))
     def get_using_bnb_for_fees(self):
-        return self.binance_client.get_bnb_burn_spot_margin()["spotBNBBurn"]
+        return self._retry_on_error(self.binance_client.get_bnb_burn_spot_margin)["spotBNBBurn"]
 
     def get_fee(self, origin_coin: Coin, target_coin: Coin, selling: bool):
-        base_fee = self.get_trade_fees()[origin_coin + target_coin]
-        if not self.testnet:
-            if not self.get_using_bnb_for_fees():
-                return base_fee
+        try:
+            base_fee = self.get_trade_fees()[origin_coin + target_coin]
+            if not self.testnet:
+                if not self.get_using_bnb_for_fees():
+                    return base_fee
 
-        # The discount is only applied if we have enough BNB to cover the fee
-        amount_trading = (
-            self._sell_quantity(origin_coin.symbol, target_coin.symbol)
-            if selling
-            else self._buy_quantity(origin_coin.symbol, target_coin.symbol)
-        )
+            # The discount is only applied if we have enough BNB to cover the fee
+            amount_trading = (
+                self._sell_quantity(origin_coin.symbol, target_coin.symbol)
+                if selling
+                else self._buy_quantity(origin_coin.symbol, target_coin.symbol)
+            )
 
-        fee_amount = amount_trading * base_fee * 0.75
-        if origin_coin.symbol == "BNB":
-            fee_amount_bnb = fee_amount
-        else:
-            origin_price = self.get_ticker_price(origin_coin + Coin("BNB"))
-            if origin_price is None:
-                return base_fee
-            fee_amount_bnb = fee_amount * origin_price
+            fee_amount = amount_trading * base_fee * 0.75
+            if origin_coin.symbol == "BNB":
+                fee_amount_bnb = fee_amount
+            else:
+                origin_price = self.get_ticker_price(origin_coin + Coin("BNB"))
+                if origin_price is None:
+                    return base_fee
+                fee_amount_bnb = fee_amount * origin_price
 
-        bnb_balance = self.get_currency_balance("BNB")
+            bnb_balance = self.get_currency_balance("BNB")
 
-        if bnb_balance >= fee_amount_bnb:
-            return base_fee * 0.75
-        return base_fee
+            if bnb_balance >= fee_amount_bnb:
+                return base_fee * 0.75
+            return base_fee
+        except Exception as e:
+            self.logger.error(f"Error getting fee: {str(e)}")
+            return 0.001  # Return default fee on error
 
     def get_account(self):
-        """
-        Get account information
-        """
-        return self.binance_client.get_account()
+        """Get account information"""
+        return self._retry_on_error(self.binance_client.get_account)
 
     def get_ticker_price(self, ticker_symbol: str):
-        """
-        Get ticker price of a specific coin
-        """
+        """Get ticker price of a specific coin"""
         price = self.cache.ticker_values.get(ticker_symbol, None)
         if price is None and ticker_symbol not in self.cache.non_existent_tickers:
-            self.cache.ticker_values = {
-                ticker["symbol"]: float(ticker["price"]) for ticker in self.binance_client.get_symbol_ticker()
-            }
-            self.logger.debug(f"Fetched all ticker prices: {self.cache.ticker_values}")
-            price = self.cache.ticker_values.get(ticker_symbol, None)
-            if price is None:
-                self.logger.info(f"Ticker does not exist: {ticker_symbol} - will not be fetched from now on")
-                self.cache.non_existent_tickers.add(ticker_symbol)
-
+            try:
+                self.cache.ticker_values = {
+                    ticker["symbol"]: float(ticker["price"]) 
+                    for ticker in self._retry_on_error(self.binance_client.get_symbol_ticker)
+                }
+                self.logger.debug(f"Fetched all ticker prices: {self.cache.ticker_values}")
+                price = self.cache.ticker_values.get(ticker_symbol, None)
+                if price is None:
+                    self.logger.info(f"Ticker does not exist: {ticker_symbol} - will not be fetched from now on")
+                    self.cache.non_existent_tickers.add(ticker_symbol)
+            except Exception as e:
+                self.logger.error(f"Error fetching ticker price: {str(e)}")
+                return None
         return price
 
     def get_currency_balance(self, currency_symbol: str, force=False) -> float:
@@ -121,7 +143,7 @@ class BinanceAPIManager:
                 cache_balances.update(
                     {
                         currency_balance["asset"]: float(currency_balance["free"])
-                        for currency_balance in self.binance_client.get_account()["balances"]
+                        for currency_balance in self._retry_on_error(self.binance_client.get_account)["balances"]
                     }
                 )
                 self.logger.debug(f"Fetched all balances: {cache_balances}")
@@ -146,7 +168,7 @@ class BinanceAPIManager:
     def get_symbol_filter(self, origin_symbol: str, target_symbol: str, filter_type: str):
         return next(
             _filter
-            for _filter in self.binance_client.get_symbol_info(origin_symbol + target_symbol)["filters"]
+            for _filter in self._retry_on_error(self.binance_client.get_symbol_info)(origin_symbol + target_symbol)["filters"]
             if _filter["filterType"] == filter_type
         )
 
@@ -182,7 +204,7 @@ class BinanceAPIManager:
                 if self._should_cancel_order(order_status):
                     cancel_order = None
                     while cancel_order is None:
-                        cancel_order = self.binance_client.cancel_order(
+                        cancel_order = self._retry_on_error(self.binance_client.cancel_order)(
                             symbol=origin_symbol + target_symbol, orderId=order_id
                         )
                     self.logger.info("Order timeout, canceled...")
@@ -194,7 +216,7 @@ class BinanceAPIManager:
                         order_quantity = self._sell_quantity(origin_symbol, target_symbol)
                         partially_order = None
                         while partially_order is None:
-                            partially_order = self.binance_client.order_market_sell(
+                            partially_order = self._retry_on_error(self.binance_client.order_market_sell)(
                                 symbol=origin_symbol + target_symbol,
                                 quantity=order_quantity,
                             )
@@ -275,7 +297,7 @@ class BinanceAPIManager:
 
         origin_balance = self.get_currency_balance(origin_symbol)
         target_balance = self.get_currency_balance(target_symbol)
-        pair_info = self.binance_client.get_symbol_info(origin_symbol + target_symbol)
+        pair_info = self._retry_on_error(self.binance_client.get_symbol_info)(origin_symbol + target_symbol)
         from_coin_price = self.get_ticker_price(origin_symbol + target_symbol)
         from_coin_price_s = "{:0.0{}f}".format(from_coin_price, pair_info["quotePrecision"])
 
@@ -289,7 +311,7 @@ class BinanceAPIManager:
         order_guard = self.stream_manager.acquire_order_guard()
         while order is None:
             try:
-                order = self.binance_client.order_limit_buy(
+                order = self._retry_on_error(self.binance_client.order_limit_buy)(
                     symbol=origin_symbol + target_symbol,
                     quantity=order_quantity_s,
                     price=from_coin_price_s,
@@ -338,7 +360,7 @@ class BinanceAPIManager:
         origin_balance = self.get_currency_balance(origin_symbol)
         target_balance = self.get_currency_balance(target_symbol)
 
-        pair_info = self.binance_client.get_symbol_info(origin_symbol + target_symbol)
+        pair_info = self._retry_on_error(self.binance_client.get_symbol_info)(origin_symbol + target_symbol)
         from_coin_price = self.get_ticker_price(origin_symbol + target_symbol)
         from_coin_price_s = "{:0.0{}f}".format(from_coin_price, pair_info["quotePrecision"])
 
@@ -351,7 +373,7 @@ class BinanceAPIManager:
         order_guard = self.stream_manager.acquire_order_guard()
         while order is None:
             # Should sell at calculated price to avoid lost coin
-            order = self.binance_client.order_limit_sell(
+            order = self._retry_on_error(self.binance_client.order_limit_sell)(
                 symbol=origin_symbol + target_symbol,
                 quantity=(order_quantity_s),
                 price=from_coin_price_s,
