@@ -1,8 +1,5 @@
 #!python3
 import time
-import traceback
-from requests.exceptions import ConnectionError, ReadTimeout, RequestException
-from binance.exceptions import BinanceAPIException
 
 from .binance_api_manager import BinanceAPIManager
 from .config import Config
@@ -46,34 +43,9 @@ def main():
     schedule.every(1).minutes.do(trader.update_values).tag("updating value history")
     schedule.every(1).minutes.do(db.prune_scout_history).tag("pruning scout history")
     schedule.every(1).hours.do(db.prune_value_history).tag("pruning value history")
-
-    consecutive_errors = 0
-    max_consecutive_errors = 5
-    error_cooldown = 60  # seconds to wait after multiple errors
-
     try:
         while True:
-            try:
-                schedule.run_pending()
-                consecutive_errors = 0  # Reset error counter on successful run
-                time.sleep(1)
-            except (ConnectionError, ReadTimeout, RequestException, BinanceAPIException) as e:
-                consecutive_errors += 1
-                logger.error(f"Connection error occurred: {str(e)}")
-                logger.error(traceback.format_exc())
-                
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.warning(f"Too many consecutive errors ({consecutive_errors}). Waiting {error_cooldown} seconds before retrying...")
-                    time.sleep(error_cooldown)
-                    consecutive_errors = 0
-                else:
-                    time.sleep(5)  # Short delay before retrying
-            except Exception as e:  # pylint: disable=broad-except
-                logger.error(f"Unexpected error occurred: {str(e)}")
-                logger.error(traceback.format_exc())
-                time.sleep(5)
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
+            schedule.run_pending()
+            time.sleep(1)
     finally:
         manager.stream_manager.close()
-        logger.info("Shutdown complete")
