@@ -36,27 +36,25 @@ class RetryBinanceClient:
         if not callable(attr):
             return attr
         
-        self.logger.info(f"Wrapping method: {name}")
-        
         # Wrap method calls with retry logic
         def wrapper(*args, **kwargs):
             start_time = time.time()
             method_name = name
             
             # Log method call with parameters (sanitized for security)
-            self.logger.debug(f"Calling Binance API method: {method_name}")
+            self.logger.info(f"Calling Binance API method: {method_name}")
             if args:
-                self.logger.debug(f"  Args: {args}")
+                self.logger.info(f"  Args: {args}")
             if kwargs:
                 # Filter out sensitive parameters
                 safe_kwargs = {k: v for k, v in kwargs.items() if 'key' not in k.lower() and 'secret' not in k.lower()}
-                self.logger.debug(f"  Kwargs: {safe_kwargs}")
+                self.logger.info(f"  Kwargs: {safe_kwargs}")
             
             for attempt in range(self.max_retries):
                 attempt_start_time = time.time()
                 
                 try:
-                    self.logger.debug(f"Attempt {attempt + 1}/{self.max_retries} for {method_name}")
+                    self.logger.info(f"Attempt {attempt + 1}/{self.max_retries} for {method_name}")
                     result = attr(*args, **kwargs)
                     
                     # Log successful call
@@ -64,7 +62,7 @@ class RetryBinanceClient:
                     total_duration = time.time() - start_time
                     
                     if attempt == 0:
-                        self.logger.debug(f"✓ {method_name} succeeded on first attempt (took {attempt_duration:.3f}s)")
+                        self.logger.info(f"✓ {method_name} succeeded on first attempt (took {attempt_duration:.3f}s)")
                     else:
                         self.logger.info(f"✓ {method_name} succeeded on attempt {attempt + 1} after {total_duration:.3f}s total")
                     
@@ -74,28 +72,28 @@ class RetryBinanceClient:
                     attempt_duration = time.time() - attempt_start_time
                     
                     if attempt < self.max_retries - 1:
-                        self.logger.warning(f"⚠ Connection error in {method_name}, retrying in {self.retry_delay}s (attempt {attempt + 1}/{self.max_retries}, took {attempt_duration:.3f}s): {e}")
+                        self.logger.info(f"⚠ Connection error in {method_name}, retrying in {self.retry_delay}s (attempt {attempt + 1}/{self.max_retries}, took {attempt_duration:.3f}s): {e}")
                         time.sleep(self.retry_delay)
                     else:
                         total_duration = time.time() - start_time
-                        self.logger.error(f"✗ Failed to call {method_name} after {self.max_retries} attempts (total time: {total_duration:.3f}s): {e}")
+                        self.logger.info(f"✗ Failed to call {method_name} after {self.max_retries} attempts (total time: {total_duration:.3f}s): {e}")
                         raise
                         
                 except BinanceAPIException as e:
                     # Don't retry on API exceptions (like invalid parameters, rate limits, etc.)
                     attempt_duration = time.time() - attempt_start_time
-                    self.logger.error(f"✗ Binance API exception in {method_name} (attempt {attempt + 1}, took {attempt_duration:.3f}s): {e}")
+                    self.logger.info(f"✗ Binance API exception in {method_name} (attempt {attempt + 1}, took {attempt_duration:.3f}s): {e}")
                     raise
                     
                 except Exception as e:
                     attempt_duration = time.time() - attempt_start_time
                     
                     if attempt < self.max_retries - 1:
-                        self.logger.warning(f"⚠ Unexpected error in {method_name}, retrying in {self.retry_delay}s (attempt {attempt + 1}/{self.max_retries}, took {attempt_duration:.3f}s): {e}")
+                        self.logger.info(f"⚠ Unexpected error in {method_name}, retrying in {self.retry_delay}s (attempt {attempt + 1}/{self.max_retries}, took {attempt_duration:.3f}s): {e}")
                         time.sleep(self.retry_delay)
                     else:
                         total_duration = time.time() - start_time
-                        self.logger.error(f"✗ Failed to call {method_name} after {self.max_retries} attempts (total time: {total_duration:.3f}s): {e}")
+                        self.logger.info(f"✗ Failed to call {method_name} after {self.max_retries} attempts (total time: {total_duration:.3f}s): {e}")
                         raise
         
         return wrapper
