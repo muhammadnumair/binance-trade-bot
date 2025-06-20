@@ -12,17 +12,65 @@ from .config import Config
 from .database import Database
 from .logger import Logger
 from .models import Coin
+import requests
 
+
+class RetryBinanceClient:
+    """
+    A wrapper around the Binance client that adds retry logic to all method calls.
+    """
+    def __init__(self, client: Client, logger: Logger, max_retries: int = 3, retry_delay: float = 2.0):
+        self._client = client
+        self.logger = logger
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+
+    def __getattr__(self, name):
+        """
+        Intercept all attribute access and wrap method calls with retry logic.
+        """
+        attr = getattr(self._client, name)
+        
+        # If it's not a method, return it as-is
+        if not callable(attr):
+            return attr
+        
+        # Wrap method calls with retry logic
+        def wrapper(*args, **kwargs):
+            for attempt in range(self.max_retries):
+                try:
+                    return attr(*args, **kwargs)
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                    if attempt < self.max_retries - 1:
+                        self.logger.warning(f"Connection error in {name}, retrying in {self.retry_delay}s (attempt {attempt + 1}/{self.max_retries}): {e}")
+                        time.sleep(self.retry_delay)
+                    else:
+                        self.logger.error(f"Failed to call {name} after {self.max_retries} attempts: {e}")
+                        raise
+                except BinanceAPIException as e:
+                    # Don't retry on API exceptions (like invalid parameters, rate limits, etc.)
+                    raise
+                except Exception as e:
+                    if attempt < self.max_retries - 1:
+                        self.logger.warning(f"Unexpected error in {name}, retrying in {self.retry_delay}s (attempt {attempt + 1}/{self.max_retries}): {e}")
+                        time.sleep(self.retry_delay)
+                    else:
+                        self.logger.error(f"Failed to call {name} after {self.max_retries} attempts: {e}")
+                        raise
+        
+        return wrapper
 
 class BinanceAPIManager:
     def __init__(self, config: Config, db: Database, logger: Logger, testnet = False):
         # initializing the client class calls `ping` API endpoint, verifying the connection
-        self.binance_client = Client(
+        binance_client = Client(
             config.BINANCE_API_KEY,
             config.BINANCE_API_SECRET_KEY,
             tld=config.BINANCE_TLD,
             testnet=testnet,
         )
+        # Wrap the client with retry logic
+        self.binance_client = RetryBinanceClient(binance_client, logger)
         self.db = db
         self.logger = logger
         self.config = config
