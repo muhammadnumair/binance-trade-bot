@@ -36,6 +36,8 @@ class RetryBinanceClient:
         if not callable(attr):
             return attr
         
+        self.logger.info(f"Wrapping method: {name}")
+        
         # Wrap method calls with retry logic
         def wrapper(*args, **kwargs):
             start_time = time.time()
